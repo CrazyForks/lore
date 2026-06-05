@@ -895,39 +895,62 @@ pub async fn clone(
     // — a re-acquire attempt would deadlock, since the guard is non-reentrant.
     let write_token = RepositoryWriteToken::acquire(path).await;
 
-    // Initialize repository storage on disk
-    {
-        let _repository = repository::create_local(
-            path,
-            &write_token,
-            repository_data.id,
-            repository_metadata.default_branch,
-            repository_metadata.default_branch_name.clone(),
-            repository_config,
-            options.no_tracking,
-        )
-        .await
-        .forward::<CloneError>("Failed to initialize repository on disk")?;
-    }
-    lore_debug!("Initialized repository on disk in {}", path.display());
-
-    let access = if options.no_tracking {
+    let repository_id = repository_data.id;
+    let default_branch_id = repository_metadata.default_branch;
+    let default_branch_name = repository_metadata.default_branch_name.clone();
+    let no_tracking = options.no_tracking;
+    let access = if no_tracking {
         RepositoryAccess::NoStore
     } else {
         RepositoryAccess::ReadWrite
     };
-    // Share the outer write token to whichever context we load. The Client
-    // token's per-path mutex (acquired at the top of clone) serializes
-    // concurrent same-path clones; the mutex is meaningful even in NoStore
-    // mode because both clones still race on the destination directory's
-    // file materialization. Sharing here means downstream helpers
-    // (`branch::create` → `store_name_to_id` / `metadata_store` /
-    // `store_latest`) see a context with write capability and can populate
-    // the (in-memory or on-disk) mutable store.
-    let load_token = Some(write_token.share());
-    let repository = repository::load_and_connect_with_token(path, access, load_token)
-        .await
-        .forward::<CloneError>("Failed to load revision state")?;
+
+    let prefetch_branch_fut = {
+        let remote = remote.clone();
+        let revision_pinned = revision.is_some();
+        async move {
+            if revision_pinned {
+                Ok::<_, CloneError>(None)
+            } else {
+                let status = branch::load_remote(remote, repository_id, default_branch_id)
+                    .await
+                    .forward::<CloneError>("Failed to load repository state from remote")?;
+                Ok(Some(status))
+            }
+        }
+    };
+
+    let local_init_fut = async move {
+        {
+            let _repository = repository::create_local(
+                path,
+                &write_token,
+                repository_id,
+                default_branch_id,
+                default_branch_name,
+                repository_config,
+                no_tracking,
+            )
+            .await
+            .forward::<CloneError>("Failed to initialize repository on disk")?;
+        }
+        lore_debug!("Initialized repository on disk in {}", path.display());
+
+        // Share the outer write token to whichever context we load. The Client
+        // token's per-path mutex (acquired at the top of clone) serializes
+        // concurrent same-path clones; the mutex is meaningful even in NoStore
+        // mode because both clones still race on the destination directory's
+        // file materialization. Sharing here means downstream helpers
+        // (`branch::create` → `store_name_to_id` / `metadata_store` /
+        // `store_latest`) see a context with write capability and can populate
+        // the (in-memory or on-disk) mutable store.
+        let load_token = Some(write_token.share());
+        repository::load_and_connect_with_token(path, access, load_token)
+            .await
+            .forward::<CloneError>("Failed to load revision state")
+    };
+
+    let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;
 
     // Copy the view definition if given
     let filter_view = if let Some(view) = view {
@@ -1011,10 +1034,13 @@ pub async fn clone(
         repository_metadata.default_branch
     };
 
-    // Ensure branch exists remotely
-    let branch = branch::load_remote(remote.clone(), repository.id, branch_id)
-        .await
-        .forward::<CloneError>("Failed to load repository state from remote")?;
+    let branch = if let Some(branch) = prefetched_branch {
+        branch
+    } else {
+        branch::load_remote(remote.clone(), repository.id, branch_id)
+            .await
+            .forward::<CloneError>("Failed to load repository state from remote")?
+    };
 
     let metadata = metadata::Metadata::deserialize(repository.clone(), branch.metadata)
         .await
@@ -1030,11 +1056,7 @@ pub async fn clone(
     }
 
     let mut revision = if revision.is_zero() {
-        let head = branch::load_remote_latest(remote.clone(), repository.id, branch_id)
-            .await
-            .forward::<CloneError>("Failed to create local branch")?;
-
-        if head.is_zero() {
+        if branch.latest.is_zero() {
             if branch_id != repository_metadata.default_branch {
                 return Err(CloneError::internal(
                     "Cloned an empty repository without revisions - did you try to clone a non-existing branch?",
@@ -1042,7 +1064,7 @@ pub async fn clone(
             }
             lore_warn!("Cloned an empty repository without revisions - did you forget to push?");
         }
-        head
+        branch.latest
     } else {
         revision
     };
