@@ -1,15 +1,15 @@
 # Glossary conventions
 
-The rules for maintaining the Lore glossary at [`docs/glossary.md`](../../../glossary.md). Load this file when adding or revising glossary entries.
+The rules for maintaining the Lore glossary at [`docs/glossary.md`](../../../glossary.md). Read this before you add or revise a glossary entry.
 
-Voice and word-choice rules live in [`../canon/language.md`](../canon/language.md). Glossary as a structural element is documented in [`../canon/doc-types.md` § Glossary](../canon/doc-types.md#glossary).
+Voice and word-choice rules live in [`../canon/language.md`](../canon/language.md). For the glossary's role as a structural element, see [`../canon/doc-types.md` § Glossary](../canon/doc-types.md#glossary).
 
 ## When a term belongs in the glossary
 
 Add a term to the glossary when at least one of the following is true:
 
 - It's **specialized** to Lore or to version control, and a generalist reader won't know it. *(Examples: `revision`, `working tree`.)*
-- It has **multiple senses** that need disambiguation. *(Example: `commit` (verb, the act) vs `commit` (noun, the object).)*
+- It has **multiple senses** that need disambiguation. *(Example: `stage` (verb, the act) vs `stage` (noun, the object).)*
 - It's an **acronym or abbreviation** whose expansion is load-bearing in Lore docs. *(Examples: `CR`, `URL`.)*
 - It's a **product, feature, or tool name** with fixed capitalization the project has decided on. *(Examples: `Lore`.)*
 
@@ -126,23 +126,23 @@ A snapshot of the working tree at a point in time.
 Compare to: revision.
 ```
 
-Cross-reference targets are written in plain text. The doc-site renderer is responsible for resolving them; don't hand-author hyperlinks inside the glossary source.
+Write cross-reference targets in plain text. The doc-site renderer resolves them — don't hand-author hyperlinks in the glossary source.
 
 ## External links inside definitions
 
-When a term has an external authoritative reference (a vendor's docs, a standard, an academic source), append a `For more information, see:` block at the end of the definition. Use plain bare URLs — not Markdown link syntax — so glossary tooling can autolink them and so they render correctly in both raw and rendered forms.
+When a term has an external authoritative reference — a vendor's docs, a standard, an academic source — append a `For more information, see:` block at the end of the definition. Wrap each URL in angle brackets (`<https://…>`). That's a Markdown autolink, not `[text](url)` link syntax. The angle-bracket form renders as a clickable link in the built site, and it still reads as a plain URL in raw Markdown. Don't drop the brackets: the MkDocs configuration doesn't autolink bare URLs, so a plain URL renders as dead text and trips markdownlint's `MD034` rule.
 
 ```markdown
 ### Three-way merge
 A merge algorithm that uses a common ancestor revision plus the two heads being merged. The result preserves changes from both sides where they don't conflict.
 
 For more information, see:
-Three-way merge https://example.com/three-way-merge
+Three-way merge <https://example.com/three-way-merge>
 ```
 
 ## Linking from doc pages back to the glossary
 
-The first occurrence of a glossary term on a doc page links to its glossary entry. Subsequent occurrences on the same page are unlinked.
+Link the first occurrence of a glossary term on a doc page to its entry. Leave later occurrences on the same page unlinked.
 
 ```markdown
 <!-- correct -->

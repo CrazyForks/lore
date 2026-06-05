@@ -2,8 +2,8 @@ site_name: Lore Developer Documentation
 
 theme:
   name: material
-  logo: assets/icons/lore-logo-horizontal.svg
-  favicon: assets/icons/favicon.svg
+  logo: assets/icons/Lore_White_V1.svg
+  favicon: assets/icons/Lore_Icon_White_V1.svg
   # Force dark-only — no auto switching, no light toggle.
   palette:
     - scheme: slate

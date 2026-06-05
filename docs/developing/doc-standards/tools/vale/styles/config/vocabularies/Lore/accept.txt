@@ -17,6 +17,7 @@ Git's
 
 # Tools and products referenced by name:
 Excalidraw
+Fortnite
 markdownlint
 mockall
 napi-rs
@@ -26,9 +27,11 @@ thiserror
 uv
 
 # Lore-specific or revision-control jargon:
+Merkle
 [Nn]exus
 lede
 Perforce-isms
+[Rr]ebase
 
 # English words missing from Vale's bundled Hunspell dictionary:
 allowlist
@@ -43,6 +46,7 @@ backlinks
 [Cc]onfig
 [Cc]onfigs
 deduplicated
+deduplication
 diffable
 enum
 enums
@@ -52,10 +56,13 @@ hostnames
 [Ll]owercase
 lowercased
 pagetree
+paywalled
+pluggable
 px
 relitigating
 reframed
 repo
+roadmaps
 ruleset
 Setext
 stderr
