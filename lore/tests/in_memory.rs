@@ -218,4 +218,98 @@ mod tests {
             "Status after release should error — old in-memory data should be gone"
         );
     }
+
+    /// Stage a nested directory tree, then call status with `count` set and
+    /// verify the reported directory and file totals match the staged tree.
+    /// Exercises the bounded parallel subtree counter: totals are exact even
+    /// though the workers process subtrees in nondeterministic order.
+    #[tokio::test]
+    async fn status_count_reports_staged_tree_totals() {
+        let tempdir = TempDir::new("lore-in-memory-test-");
+        let repository_path = tempdir.path().to_path_buf();
+        let globals = in_memory_globals(&repository_path);
+
+        let name: String = Alphanumeric.sample_string(&mut rand::rng(), 16);
+        let mut url = String::from_str("lore://localhost/").unwrap_or_default();
+        url.push_str(name.as_str());
+        let args = LoreRepositoryCreateArgs {
+            repository_url: url.into(),
+            id: LoreString::default(),
+            description: LoreString::default(),
+            use_shared_store: 0,
+            shared_store_path: LoreString::default(),
+        };
+        let result = lore::repository::create(globals.clone(), args, None).await;
+        assert_eq!(result, 0, "Failed to create repository");
+
+        let relative_files = [
+            "a.txt",
+            "dir1/b.txt",
+            "dir1/dir1a/c.txt",
+            "dir2/d.txt",
+            "dir2/e.txt",
+        ];
+        let mut file_paths = Vec::new();
+        for relative in relative_files {
+            let file_path = repository_path.join(relative);
+            std::fs::create_dir_all(file_path.parent().expect("file has a parent"))
+                .expect("Failed to create directory");
+            let mut file = std::fs::File::options()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&file_path)
+                .expect("Failed to create test file");
+            file.write_all(b"data").expect("Failed to write test file");
+            file_paths.push(LoreString::from(&file_path));
+        }
+
+        let args = LoreFileStageArgs {
+            paths: LoreArray::from_vec(file_paths),
+            case_change: 0,
+            scan: 1,
+        };
+        let result = lore::file::stage(globals.clone(), args, None).await;
+        assert_eq!(result, 0, "Failed to stage files");
+
+        let directories: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let files: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let directories_ = Arc::clone(&directories);
+        let files_ = Arc::clone(&files);
+
+        let callback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::RepositoryStatusCount(data) => {
+                *directories_.lock() = Some(data.directories);
+                *files_.lock() = Some(data.files);
+            }
+            LoreEvent::Error(data) => {
+                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
+            }
+            _ => (),
+        }) as Box<_>);
+
+        let args = LoreRepositoryStatusArgs {
+            staged: 1,
+            scan: 0,
+            check_dirty: 0,
+            reset: 0,
+            sync_point: 0,
+            revision_only: 0,
+            count: 1,
+            paths: LoreArray::default(),
+        };
+        let result = lore::repository::status(globals.clone(), args, callback).await;
+        assert_eq!(result, 0, "Status call failed");
+
+        assert_eq!(
+            *directories.lock(),
+            Some(3),
+            "expected directories dir1, dir1/dir1a, dir2"
+        );
+        assert_eq!(
+            *files.lock(),
+            Some(5),
+            "expected files a.txt, dir1/b.txt, dir1/dir1a/c.txt, dir2/d.txt, dir2/e.txt"
+        );
+    }
 }

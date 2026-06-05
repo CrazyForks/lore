@@ -2686,6 +2686,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "crossbeam",
  "dashmap",
  "diffy",
  "fastcdc",

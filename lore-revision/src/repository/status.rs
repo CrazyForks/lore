@@ -6,12 +6,18 @@ use std::os::unix::fs::MetadataExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use crossbeam::queue::SegQueue;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use super::RepositoryContext;
@@ -434,107 +440,76 @@ async fn dirty_change_is_modified(
     Ok(is_modified)
 }
 
-/// Recursively count directories and files under `parent_node_id` in `state`,
-/// honoring the repository's local view filter. A link node is counted as a
-/// directory and descended into (resolved to its target repository/revision).
-/// Returns `(directories, files)`.
-async fn count_tree(
+/// Upper bound on concurrent subtree-counting tasks. Counting is dominated by
+/// per-directory node-block reads (and link resolutions that may reach other
+/// repositories), so overlapping them up to this many in-flight tasks hides I/O
+/// latency while keeping fan-out bounded on huge trees. Scaled to the machine
+/// but capped so a many-core host doesn't spawn excessive workers.
+const COUNT_MAX_CONCURRENCY: usize = 128;
+
+/// A directory (or resolved link target) whose children still need counting.
+struct CountWork {
     state: Arc<state::State>,
     repository: Arc<RepositoryContext>,
-    parent_node_id: NodeID,
-    parent_path: RelativePath,
-) -> Result<(u64, u64), StatusError> {
-    let mut directories = 0u64;
-    let mut files = 0u64;
-
-    let mut children = state::StateNodeChildrenWithNameIterator::new(
-        state.clone(),
-        repository.clone(),
-        parent_node_id,
-    )
-    .await
-    .forward::<StatusError>("iterating revision tree children")?;
-
-    while let Some((child_id, child_node, child_name)) = children
-        .next()
-        .await
-        .forward::<StatusError>("reading revision tree node")?
-    {
-        let is_directory = child_node.is_directory();
-        let is_link = child_node.is_link();
-        let child_path = parent_path.push_into_buf(child_name).freeze();
-
-        if repository
-            .filter
-            .excludes(&child_path, is_directory || is_link, FilterMode::View)
-        {
-            continue;
-        }
-
-        if is_directory {
-            directories += 1;
-            let (sub_directories, sub_files) = Box::pin(count_tree(
-                state.clone(),
-                repository.clone(),
-                child_id,
-                child_path,
-            ))
-            .await?;
-            directories += sub_directories;
-            files += sub_files;
-        } else if is_link {
-            directories += 1;
-            let link = child_node.linked_node();
-            let (link_repository, link_state) = link
-                .resolve(repository.clone(), state.clone())
-                .await
-                .forward::<StatusError>("resolving link target for count")?;
-            let (sub_directories, sub_files) = Box::pin(count_tree(
-                link_state,
-                link_repository,
-                link.node,
-                child_path,
-            ))
-            .await?;
-            directories += sub_directories;
-            files += sub_files;
-        } else if child_node.is_file() {
-            files += 1;
-        }
-    }
-
-    Ok((directories, files))
+    node_id: NodeID,
+    path: RelativePath,
 }
 
-/// Count the subtree rooted at `source_path` in `state` (the node itself plus
-/// its descendants), labelling descendant paths under `target_path` for view
-/// filtering. The two differ for a layer: the node is resolved at the layer's
-/// `source_path` while paths are labelled with the mount `target_path`, so the
-/// local view filter matches the working-tree layout. A file yields `(0, 1)`,
-/// a directory or link `(1 + sub_directories, sub_files)`. An empty
+/// Shared state for the bounded worker pool counting view-filtered nodes.
+///
+/// The recursion is reified as an explicit lock-free `queue` of [`CountWork`]
+/// items drained by a fixed set of workers, rather than recursive task
+/// spawning, so concurrency is hard-bounded by the worker count regardless of
+/// tree shape. `outstanding` tracks items neither fully processed nor yet
+/// counted (queued plus in flight); workers exit once it reaches zero. The
+/// first error is kept in `error`, after which workers stop processing but
+/// keep draining so the counter still reaches zero and every worker terminates.
+struct CountShared {
+    queue: SegQueue<CountWork>,
+    outstanding: AtomicUsize,
+    directories: AtomicU64,
+    files: AtomicU64,
+    error: OnceLock<StatusError>,
+    notify: Notify,
+}
+
+/// Resolve `source_path` to the work needed to count its subtree, labelling
+/// descendant paths under `target_path` for view filtering. The two differ for
+/// a layer: the node is resolved at the layer's `source_path` while paths are
+/// labelled with the mount `target_path`, so the local view filter matches the
+/// working-tree layout. Returns the node's own `(directories, files)`
+/// contribution plus an optional root [`CountWork`] for its descendants. A file
+/// yields `(0, 1, None)`; a directory or link `(1, 0, Some(work))`. An empty
 /// `source_path` is the root of `state` (a layer whose source is the repo
 /// root), counted as one directory plus its descendants. An unresolved path
-/// yields `(0, 0)`.
-async fn count_at_path(
+/// yields `(0, 0, None)`.
+async fn count_at_path_root(
     state: Arc<state::State>,
     repository: Arc<RepositoryContext>,
     source_path: &RelativePath,
     target_path: &RelativePath,
-) -> Result<(u64, u64), StatusError> {
+) -> Result<(u64, u64, Option<CountWork>), StatusError> {
     if source_path.is_empty() {
-        let (directories, files) =
-            count_tree(state, repository, ROOT_NODE, target_path.clone()).await?;
-        return Ok((1 + directories, files));
+        return Ok((
+            1,
+            0,
+            Some(CountWork {
+                state,
+                repository,
+                node_id: ROOT_NODE,
+                path: target_path.clone(),
+            }),
+        ));
     }
 
     let Ok(link) = state
         .find_node_link(repository.clone(), source_path.as_str())
         .await
     else {
-        return Ok((0, 0));
+        return Ok((0, 0, None));
     };
     if !link.is_valid() {
-        return Ok((0, 0));
+        return Ok((0, 0, None));
     }
 
     let (repository, state) = link
@@ -547,7 +522,7 @@ async fn count_at_path(
         .forward::<StatusError>("reading count path node")?;
 
     if node.is_file() {
-        return Ok((0, 1));
+        return Ok((0, 1, None));
     }
 
     if node.is_link() {
@@ -556,14 +531,190 @@ async fn count_at_path(
             .resolve(repository.clone(), state.clone())
             .await
             .forward::<StatusError>("resolving count path link target")?;
-        let (directories, files) =
-            count_tree(state, repository, inner.node, target_path.clone()).await?;
-        return Ok((1 + directories, files));
+        return Ok((
+            1,
+            0,
+            Some(CountWork {
+                state,
+                repository,
+                node_id: inner.node,
+                path: target_path.clone(),
+            }),
+        ));
     }
 
-    let (directories, files) =
-        count_tree(state, repository, link.node, target_path.clone()).await?;
-    Ok((1 + directories, files))
+    Ok((
+        1,
+        0,
+        Some(CountWork {
+            state,
+            repository,
+            node_id: link.node,
+            path: target_path.clone(),
+        }),
+    ))
+}
+
+/// Count `work`'s direct children, honoring the repository's local view filter,
+/// adding files/directories to the shared totals and pushing each directory (or
+/// resolved link target) back onto the shared stack for later counting. A link
+/// node is counted as a directory and descended into.
+async fn count_node_children(work: &CountWork, shared: &CountShared) -> Result<(), StatusError> {
+    let mut children = state::StateNodeChildrenWithNameIterator::new(
+        work.state.clone(),
+        work.repository.clone(),
+        work.node_id,
+    )
+    .await
+    .forward::<StatusError>("iterating revision tree children")?;
+
+    let mut directories = 0u64;
+    let mut files = 0u64;
+    let mut pushed = Vec::new();
+
+    while let Some((child_id, child_node, child_name)) = children
+        .next()
+        .await
+        .forward::<StatusError>("reading revision tree node")?
+    {
+        let is_directory = child_node.is_directory();
+        let is_link = child_node.is_link();
+        let child_path = work.path.push_into_buf(child_name).freeze();
+
+        if work
+            .repository
+            .filter
+            .excludes(&child_path, is_directory || is_link, FilterMode::View)
+        {
+            continue;
+        }
+
+        if is_directory {
+            directories += 1;
+            pushed.push(CountWork {
+                state: work.state.clone(),
+                repository: work.repository.clone(),
+                node_id: child_id,
+                path: child_path,
+            });
+        } else if is_link {
+            directories += 1;
+            let link = child_node.linked_node();
+            let (link_repository, link_state) = link
+                .resolve(work.repository.clone(), work.state.clone())
+                .await
+                .forward::<StatusError>("resolving link target for count")?;
+            pushed.push(CountWork {
+                state: link_state,
+                repository: link_repository,
+                node_id: link.node,
+                path: child_path,
+            });
+        } else if child_node.is_file() {
+            files += 1;
+        }
+    }
+
+    if directories > 0 {
+        shared.directories.fetch_add(directories, Ordering::Relaxed);
+    }
+    if files > 0 {
+        shared.files.fetch_add(files, Ordering::Relaxed);
+    }
+
+    if !pushed.is_empty() {
+        // Account for the new work before it becomes visible so a worker that
+        // pops and finishes a child can't drive `outstanding` to zero early.
+        shared.outstanding.fetch_add(pushed.len(), Ordering::AcqRel);
+        for work in pushed {
+            shared.queue.push(work);
+        }
+        shared.notify.notify_waiters();
+    }
+
+    Ok(())
+}
+
+/// A single pool worker: drain the shared queue until no work remains in flight.
+///
+/// Termination is driven solely by `outstanding` reaching zero, so it is robust
+/// regardless of scheduling: a notification interest is registered (`enable`)
+/// before each empty-queue check, so a concurrent push or completion can never
+/// be missed before the worker parks on `notify`.
+async fn count_worker(shared: Arc<CountShared>) -> Result<(), StatusError> {
+    loop {
+        let notified = shared.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let Some(work) = shared.queue.pop() else {
+            if shared.outstanding.load(Ordering::Acquire) == 0 {
+                shared.notify.notify_waiters();
+                return Ok(());
+            }
+            notified.await;
+            continue;
+        };
+
+        // Once any worker has failed, stop processing but keep draining so
+        // `outstanding` still reaches zero and every worker terminates. The
+        // `OnceLock` keeps the first error and ignores the rest.
+        if shared.error.get().is_none()
+            && let Err(err) = count_node_children(&work, &shared).await
+        {
+            let _ = shared.error.set(err);
+        }
+
+        if shared.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            shared.notify.notify_waiters();
+        }
+    }
+}
+
+/// Count directories and files in the subtrees rooted at `roots`, honoring each
+/// repository's local view filter, using a pool of at most
+/// [`COUNT_MAX_CONCURRENCY`] workers. Returns the summed `(directories, files)`
+/// across all roots (excluding the root nodes themselves).
+async fn count_subtrees(roots: Vec<CountWork>) -> Result<(u64, u64), StatusError> {
+    if roots.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let queue = SegQueue::new();
+    let outstanding = roots.len();
+    for work in roots {
+        queue.push(work);
+    }
+
+    let shared = Arc::new(CountShared {
+        queue,
+        outstanding: AtomicUsize::new(outstanding),
+        directories: AtomicU64::new(0),
+        files: AtomicU64::new(0),
+        error: OnceLock::new(),
+        notify: Notify::new(),
+    });
+
+    let workers = lore_base::runtime::processor_count().clamp(1, COUNT_MAX_CONCURRENCY);
+    let mut tasks = JoinSet::new();
+    for _ in 0..workers {
+        let shared = shared.clone();
+        lore_spawn!(tasks, count_worker(shared));
+    }
+    lore_drain_tasks!(tasks, StatusError::internal("Count worker task failed"))?;
+
+    let directories = shared.directories.load(Ordering::Relaxed);
+    let files = shared.files.load(Ordering::Relaxed);
+    if shared.error.get().is_some() {
+        let shared = Arc::into_inner(shared)
+            .expect("all count workers have completed and released their references");
+        return Err(shared
+            .error
+            .into_inner()
+            .expect("error presence was just observed"));
+    }
+
+    Ok((directories, files))
 }
 
 pub async fn status(
@@ -854,24 +1005,27 @@ pub async fn status(
     if options.count {
         let mut directories = 0u64;
         let mut files = 0u64;
+        let mut roots = Vec::new();
 
         for path in paths.iter() {
-            let (path_directories, path_files) = match path {
+            match path {
                 None => {
-                    count_tree(
-                        state_staged.clone(),
-                        repository.clone(),
-                        ROOT_NODE,
-                        RelativePath::default(),
-                    )
-                    .await?
+                    roots.push(CountWork {
+                        state: state_staged.clone(),
+                        repository: repository.clone(),
+                        node_id: ROOT_NODE,
+                        path: RelativePath::default(),
+                    });
                 }
                 Some(path) => {
-                    count_at_path(state_staged.clone(), repository.clone(), path, path).await?
+                    let (path_directories, path_files, work) =
+                        count_at_path_root(state_staged.clone(), repository.clone(), path, path)
+                            .await?;
+                    directories += path_directories;
+                    files += path_files;
+                    roots.extend(work);
                 }
             };
-            directories += path_directories;
-            files += path_files;
 
             for (layer, layer_state) in layers.iter() {
                 let target_path =
@@ -889,7 +1043,7 @@ pub async fn status(
                     RelativePath::new_from_clean_parts(&layer.source_path, sub_path);
                 let target_subpath =
                     RelativePath::new_from_clean_parts(&layer.target_path, sub_path);
-                let (layer_directories, layer_files) = count_at_path(
+                let (layer_directories, layer_files, work) = count_at_path_root(
                     layer_state.state_staged.clone(),
                     layer_state.repository.clone(),
                     &source_subpath,
@@ -898,8 +1052,13 @@ pub async fn status(
                 .await?;
                 directories += layer_directories;
                 files += layer_files;
+                roots.extend(work);
             }
         }
+
+        let (subtree_directories, subtree_files) = count_subtrees(roots).await?;
+        directories += subtree_directories;
+        files += subtree_files;
 
         lore_debug!("Repository size: {directories} directories, {files} files");
         event::LoreEvent::RepositoryStatusCount(LoreRepositoryStatusCountEventData {
