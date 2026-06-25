@@ -170,20 +170,7 @@ class TestForwardedBranchCreate:
 
     @pytest.mark.smoke
     def test_branch_create_delegates_write_to_server_1(self, repos):
-        """
-        Calling branch_create via Server 2 should silently delegate the write
-        to Server 1 and return the created branch to the caller as normal.
-
-        The proof of delegation is the state of the two mutable stores after the
-        call. Because each server owns a completely separate store, a branch can
-        only appear in a store if that server executed the write itself:
-
-          - Server 1's store contains the branch  → Server 1 ran the write
-          - Server 2's store does not             → Server 2 did not run it locally
-
-        A successful response from Server 2 alone would not distinguish delegation
-        from local execution; the store assertions are what makes this meaningful.
-        """
+        """Verify delegation by checking which store holds the branch after the call."""
         server_1_repo, server_2_repo = repos
         branch_name = f"feature-{uuid.uuid4().hex[:8]}"
 

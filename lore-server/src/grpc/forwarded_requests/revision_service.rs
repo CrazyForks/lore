@@ -14,6 +14,16 @@ pub trait ForwardedRevisionServiceClient: Send + Sync {
         &mut self,
         request: Request<v1::BranchCreateRequest>,
     ) -> ForwardedRequestResult<v1::BranchCreateResponse>;
+
+    async fn branch_delete(
+        &mut self,
+        request: Request<v1::BranchDeleteRequest>,
+    ) -> ForwardedRequestResult<v1::BranchDeleteResponse>;
+
+    async fn branch_get(
+        &mut self,
+        request: Request<v1::BranchGetRequest>,
+    ) -> ForwardedRequestResult<v1::BranchGetResponse>;
 }
 
 pub struct GrpcForwardedRevisionServiceClient {
@@ -35,5 +45,19 @@ impl ForwardedRevisionServiceClient for GrpcForwardedRevisionServiceClient {
         request: Request<v1::BranchCreateRequest>,
     ) -> ForwardedRequestResult<v1::BranchCreateResponse> {
         Ok(self.client.branch_create(request).await)
+    }
+
+    async fn branch_delete(
+        &mut self,
+        request: Request<v1::BranchDeleteRequest>,
+    ) -> ForwardedRequestResult<v1::BranchDeleteResponse> {
+        Ok(self.client.branch_delete(request).await)
+    }
+
+    async fn branch_get(
+        &mut self,
+        request: Request<v1::BranchGetRequest>,
+    ) -> ForwardedRequestResult<v1::BranchGetResponse> {
+        Ok(self.client.branch_get(request).await)
     }
 }

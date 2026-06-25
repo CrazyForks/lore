@@ -180,6 +180,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
+                &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
             ),
@@ -197,6 +198,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                &self.forwarded_requests,
             ),
         )
         .await

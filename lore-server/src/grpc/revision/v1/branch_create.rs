@@ -535,6 +535,22 @@ mod test {
                     .take()
                     .expect("branch_create called more than once")
             }
+
+            async fn branch_delete(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchDeleteRequest>,
+            ) -> ForwardedRequestResult<lore_proto::lore::revision::v1::BranchDeleteResponse>
+            {
+                unreachable!("branch_delete should not be called in branch_create tests")
+            }
+
+            async fn branch_get(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchGetRequest>,
+            ) -> ForwardedRequestResult<lore_proto::lore::revision::v1::BranchGetResponse>
+            {
+                unreachable!("branch_get should not be called in branch_create tests")
+            }
         }
 
         struct StubForwardedRequests {
@@ -549,6 +565,7 @@ mod test {
                 Arc::new(Self {
                     flags: RpcFlags {
                         revision_branch_create: true,
+                        ..Default::default()
                     },
                     response: Arc::new(Mutex::new(Some(response))),
                 })
@@ -560,6 +577,7 @@ mod test {
                 Arc::new(Self {
                     flags: RpcFlags {
                         revision_branch_create: false,
+                        ..Default::default()
                     },
                     response: Arc::new(Mutex::new(Some(response))),
                 })

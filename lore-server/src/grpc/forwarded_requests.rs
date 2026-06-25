@@ -102,7 +102,12 @@ pub struct ForwardedRequestsSettings {
 
 #[derive(Clone, Default, Debug, Deserialize)]
 pub struct RpcFlags {
+    #[serde(default)]
     pub revision_branch_create: bool,
+    #[serde(default)]
+    pub revision_branch_delete: bool,
+    #[serde(default)]
+    pub revision_branch_get: bool,
 }
 
 pub trait ForwardedRequests: Send + Sync {
