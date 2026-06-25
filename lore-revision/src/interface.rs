@@ -532,8 +532,8 @@ pub struct LoreGlobalArgs {
     pub search_limit: u32,
     /// Allow matching to the nearest matching revision when a perfect match is not available
     pub search_nearest: u8,
-    /// Run store compaction and eviction in the background
-    pub gc: u8,
+    /// Prevent the automatic incremental/step GC for this operation; it otherwise runs in the background on write operations. `repository gc` always runs a full pass regardless
+    pub no_gc: u8,
     /// Use in-memory stores instead of file-backed stores. No store data is
     /// read from or written to the .urc/immutable/ and .urc/mutable/ directories.
     pub in_memory: u8,
@@ -624,8 +624,8 @@ impl LoreGlobalArgs {
         self.search_nearest != 0
     }
 
-    pub fn gc(&self) -> bool {
-        self.gc != 0
+    pub fn no_gc(&self) -> bool {
+        self.no_gc != 0
     }
 
     pub fn in_memory(&self) -> bool {
@@ -869,7 +869,7 @@ pub enum LoreError {
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 5,
     /// A blob exceeded a size limit enforced by the caller or the protocol.
-    /// Discriminant matches the FFI code of the underlying `Oversized` struct
+    /// Discriminant matches the error code of the underlying `Oversized` struct
     /// in `lore-base` so callers see a single consistent code.
     Oversized = 26,
 
